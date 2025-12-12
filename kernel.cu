@@ -17,6 +17,16 @@
 #include <algorithm>
 #include <execution>
 #include <functional>
+#include <ranges>
+
+using u8 = uint8_t;
+using u16 = uint16_t;
+using u32 = uint32_t;
+using u64 = uint64_t;
+using i8 = int8_t;
+using i16 = int16_t;
+using i32 = int32_t;
+using i64 = int64_t;
 
 #define CUDA_CHECK( call )                                                 \
     do {                                                                   \
@@ -29,37 +39,40 @@
         }                                                                  \
     } while( 0 )
 
-template<typename T, typename CmpOp>
-inline bool ElementWiseRangeStrictCompare( const std::vector<T>& a, const std::vector<T>& b, CmpOp cmpOp )
+template<
+    std::ranges::contiguous_range Range1, 
+    std::ranges::contiguous_range Range2, 
+    typename CmpOp>
+inline bool ElementWiseRangeStrictCompare( const Range1 & a, const Range2 & b, CmpOp cmpOp )
 {
     if( std::size( a ) != std::size( b ) )
     {
         return false;
     }
 
-    //for( uint64_t i = 0; i < std::size( a ); ++i )
-    //{
-    //    assert( cmpOp( a[ i ], b[ i ] ) );
-    //}
-    //
-    return std::transform_reduce( 
-        std::execution::par, std::cbegin( a ), std::cend( a ), std::cbegin( b ), true, std::logical_and<>(), cmpOp );
+    for( u64 i = 0; i < std::size( a ); ++i )
+    {
+        assert( cmpOp( a[ i ], b[ i ] ) );
+    }
+    return true;
+    //return std::transform_reduce( 
+    //    std::execution::par, std::cbegin( a ), std::cend( a ), std::cbegin( b ), true, std::logical_and<>(), cmpOp );
 }
 
 // NOTE: always POT
-constexpr uint64_t WARP_SIZE = 32u;
+constexpr u64 WARP_SIZE = 32u;
 static_assert( std::has_single_bit( WARP_SIZE ), "WARP_SIZE not POT" );
-constexpr uint64_t WAPR_SZ_SHIFT = std::bit_width( WARP_SIZE ) - 1u;
+constexpr u64 WAPR_SZ_SHIFT = std::bit_width( WARP_SIZE ) - 1u;
 
-__device__ inline uint64_t LaneId() { return threadIdx.x & ( WARP_SIZE - 1 ); }
-__device__ inline uint64_t WarpId() { return threadIdx.x >> WAPR_SZ_SHIFT; }
+__device__ inline u64 LaneId() { return threadIdx.x & ( WARP_SIZE - 1 ); }
+__device__ inline u64 WarpId() { return threadIdx.x >> WAPR_SZ_SHIFT; }
 
 template<typename T>
 __device__ T WarpReduceShflDownSync( const T in )
 {
     T sum = in;
 #pragma unroll
-    for( uint64_t offsetWithinWarp = WARP_SIZE >> 1; offsetWithinWarp > 0; offsetWithinWarp >>= 1 ) 
+    for( u64 offsetWithinWarp = WARP_SIZE >> 1; offsetWithinWarp > 0; offsetWithinWarp >>= 1 ) 
     {
         sum += __shfl_down_sync( 0xffffffff, sum, offsetWithinWarp );
     }
@@ -72,7 +85,7 @@ __device__ T WarpInclusiveScanShflUpSync( const T val )
 {
     T inclusvieScan = val;
 #pragma unroll
-    for( uint64_t offset = 1; offset < WARP_SIZE; offset <<= 1 )
+    for( u64 offset = 1; offset < WARP_SIZE; offset <<= 1 )
     {
         const T warpLaneValAtOffset = __shfl_up_sync( 0xffffffff, inclusvieScan, offset );
         if( LaneId() >= offset ) // NOTE: Distributes values
@@ -83,12 +96,21 @@ __device__ T WarpInclusiveScanShflUpSync( const T val )
     return inclusvieScan;
 };
 
-constexpr uint64_t MAX_WARPS_PER_BLOCK = 32;
+constexpr u64 MAX_WARPS_PER_BLOCK = 32;
 
-template<uint64_t THREADS_PER_BLOCK_X, typename T>
-__global__ void KernelReduceBlocksWithWARP( const T* input, uint64_t workElemCount, T* partialSums )
+template<u64 SIZE, typename T>
+__device__ void InitSharedMem( T* mem, T value )
 {
-    constexpr uint64_t WARPS_PER_BLOCK = THREADS_PER_BLOCK_X / WARP_SIZE;
+    if( threadIdx.x < SIZE ) 
+    {
+        mem[ threadIdx.x ] = value;
+    }
+}
+
+template<u64 THREADS_PER_BLOCK_X, typename T>
+__global__ void KernelReduceBlocksWithWARP( const T* input, u64 workElemCount, T* partialSums )
+{
+    constexpr u64 WARPS_PER_BLOCK = THREADS_PER_BLOCK_X / WARP_SIZE;
     static_assert( WARPS_PER_BLOCK <= MAX_WARPS_PER_BLOCK, "ERR: Block has more warps !" );
 
     __shared__ T sharedPartialWarpReductions[ WARP_SIZE ]; 
@@ -99,8 +121,8 @@ __global__ void KernelReduceBlocksWithWARP( const T* input, uint64_t workElemCou
     }
     __syncthreads();
 
-    const uint64_t globalDataBlockOffset = blockDim.x * blockIdx.x; 
-    const uint64_t globalIdx = globalDataBlockOffset + threadIdx.x;
+    const u64 globalDataBlockOffset = blockDim.x * blockIdx.x; 
+    const u64 globalIdx = globalDataBlockOffset + threadIdx.x;
 
     T currentElemToSum = T{};
     if( globalIdx < workElemCount )
@@ -109,10 +131,10 @@ __global__ void KernelReduceBlocksWithWARP( const T* input, uint64_t workElemCou
     }
     
     const T currentWarpSum = WarpReduceShflDownSync( currentElemToSum );
-    const uint64_t laneID = LaneId();
+    const u64 laneID = LaneId();
     if( laneID == 0 )
     {
-        const uint64_t warpID = WarpId();
+        const u64 warpID = WarpId();
         sharedPartialWarpReductions[ warpID ] = currentWarpSum;
     }
     __syncthreads();
@@ -125,7 +147,7 @@ __global__ void KernelReduceBlocksWithWARP( const T* input, uint64_t workElemCou
         {
             const T currentPartialWarpSum = sharedPartialWarpReductions[ threadIdx.x ];
             // TODO: if this incurrs a perf issue ( due to wasted lanes ) we can use a mask to select only the active threads
-            constexpr uint32_t ACTIVE_LANES_MASK = ( 1u << WARPS_PER_BLOCK ) - 1;
+            constexpr u32 ACTIVE_LANES_MASK = ( 1u << WARPS_PER_BLOCK ) - 1;
             thisBlockSum = WarpReduceShflDownSync( currentPartialWarpSum );
         }
     }
@@ -169,25 +191,33 @@ __device__ T ThreadBlockInclusiveScanWithSync( const T currentThreadValue )
     return threadScan;
 }
 
-enum class prefix_scan_t : uint8_t
+enum atomic_prefix_block_state : u32
+{
+    UNAVAILABLE = 0,
+    HAS_LOCAL_PREFIX = 1,
+    HAS_FULL_PREFIX = 2
+};
+
+enum class prefix_scan_t : u8
 {
     INCLUSIVE,
     EXCLUSIVE
 };
-template<prefix_scan_t SCAN_TYPE, uint64_t THREADS_PER_BLOCK_X, typename T>
-__global__ void KernelChainPrefixScan( 
-    const T*      input, 
-    uint64_t      workElemCount, 
-    uint64_t*     globalGroupCounter,
-    uint32_t*     globalSemaphoreFlags,
-    T*            globalBlockPartialScans,
-    T*            scannedOut 
+template<prefix_scan_t SCAN_TYPE, u64 THREADS_PER_BLOCK_X, typename T>
+__global__ void KernelChainPrefixScanWithDecoupledLookback( 
+    const T*                 input,
+    u64                      workElemCount,
+    u64*                     globalGroupCounter,
+    u32*                     globalBlockState,
+    T*                       globalBlockLocalScans,
+    T*                       globalBlockPartialScans,
+    T*                       scannedOut 
 ) {
-    constexpr uint64_t WARPS_PER_BLOCK = THREADS_PER_BLOCK_X / WARP_SIZE;
+    constexpr u64 WARPS_PER_BLOCK = THREADS_PER_BLOCK_X / WARP_SIZE;
     static_assert( WARPS_PER_BLOCK <= MAX_WARPS_PER_BLOCK, "ERR: Block has more warps !" );
 
     // NOTE: need to get the dynamic idx of the block
-    __shared__ uint64_t sharedCurrerntBlockIdx;
+    __shared__ u64 sharedCurrerntBlockIdx;
     if( threadIdx.x == 0 )
     {
         sharedCurrerntBlockIdx = atomicAdd( globalGroupCounter, 1 );
@@ -195,8 +225,8 @@ __global__ void KernelChainPrefixScan(
     __syncthreads();
 
     // NOTE: need to use the dynamicBlockIdx to get the corresponding work
-    const uint64_t globalDataBlockOffset = blockDim.x * sharedCurrerntBlockIdx;
-    const uint64_t globalIdx = globalDataBlockOffset + threadIdx.x;
+    const u64 globalDataBlockOffset = blockDim.x * sharedCurrerntBlockIdx;
+    const u64 globalIdx = globalDataBlockOffset + threadIdx.x;
 
     T currentElemToSum = T{};
     if( globalIdx < workElemCount )
@@ -204,34 +234,56 @@ __global__ void KernelChainPrefixScan(
         currentElemToSum = input[ globalIdx ];
     }
 
-    const T blockScan = ThreadBlockInclusiveScanWithSync( currentElemToSum );
+    const T blockScanThreadElem = ThreadBlockInclusiveScanWithSync( currentElemToSum );
 
-    __shared__ T localScan;
+    __shared__ T sharedLocalBlockScan;
     if( threadIdx.x == ( blockDim.x - 1 ) )
     {
-        localScan = blockScan;
+        sharedLocalBlockScan = blockScanThreadElem;
     }
     __syncthreads();
 
-    __shared__ T sharedPrevSum;
-    // NOTE: here we force order the blocks
+    __shared__ T sharedPrevScan;
+    // NOTE: here we force order the blocks, but we'll keep looking backwards until we find a PREFIX STATE
     if( threadIdx.x == 0 )
     {
-        // NOTE: we could add a fence here if we care about immediate visiblity
-        while( atomicAdd( &globalSemaphoreFlags[ sharedCurrerntBlockIdx ], 0 ) == 0 );
-
-        sharedPrevSum = globalBlockPartialScans[ sharedCurrerntBlockIdx ];
-        
-        globalBlockPartialScans[ sharedCurrerntBlockIdx + 1 ] = sharedPrevSum + localScan;
-
+        globalBlockLocalScans[ sharedCurrerntBlockIdx ] = sharedLocalBlockScan;
         __threadfence();
-        atomicAdd( &globalSemaphoreFlags[ sharedCurrerntBlockIdx + 1 ], 1 );
+
+        atomicAdd( &globalBlockState[ sharedCurrerntBlockIdx ], 1 );
+
+        const bool isNotFirstBlock = 0 != sharedCurrerntBlockIdx;
+
+        T currentPrefixScan = T{};
+        for( i64 lookbackBlockIdx = sharedCurrerntBlockIdx - 1; isNotFirstBlock && lookbackBlockIdx >= 0; )
+        {
+            const u32 currentLookbackBlockState = atomicAdd( &globalBlockState[ lookbackBlockIdx ], 0 );
+
+            //if( atomic_prefix_block_state::UNAVAILABLE == currentLookbackBlockState ) continue;
+            //else 
+            if( atomic_prefix_block_state::HAS_LOCAL_PREFIX == currentLookbackBlockState )
+            {
+                currentPrefixScan += globalBlockLocalScans[ lookbackBlockIdx ];
+                --lookbackBlockIdx;
+            }
+            else if( atomic_prefix_block_state::HAS_FULL_PREFIX == currentLookbackBlockState )
+            {
+                currentPrefixScan += globalBlockPartialScans[ lookbackBlockIdx ];
+                break;
+            }
+        }
+
+        sharedPrevScan = currentPrefixScan;
+        globalBlockPartialScans[ sharedCurrerntBlockIdx ] = currentPrefixScan + sharedLocalBlockScan;
+        __threadfence();
+
+        atomicAdd( &globalBlockState[ sharedCurrerntBlockIdx ], 1 );
     };
     __syncthreads();
 
     if( globalIdx < workElemCount )
     {
-        T currentOut = blockScan + sharedPrevSum;
+        T currentOut = blockScanThreadElem + sharedPrevScan;
         if constexpr( SCAN_TYPE == prefix_scan_t::EXCLUSIVE )
         {
             currentOut -= currentElemToSum;
@@ -240,13 +292,13 @@ __global__ void KernelChainPrefixScan(
     }
 }
 
-template<uint64_t THREADS_PER_BLOCK_X>
-thrust::device_vector<int32_t> DispatchReductionKernel_CUDA( const thrust::device_vector<int32_t>& inputCuda )
+template<u64 THREADS_PER_BLOCK_X>
+thrust::device_vector<i32> DispatchReductionKernel_CUDA( const thrust::device_vector<i32>& inputCuda )
 {
-    const uint64_t size = std::size( inputCuda );
-    const uint64_t blocksDispatchedCount = ( size + THREADS_PER_BLOCK_X - 1 ) / THREADS_PER_BLOCK_X;
+    const u64 size = std::size( inputCuda );
+    const u64 blocksDispatchedCount = ( size + THREADS_PER_BLOCK_X - 1 ) / THREADS_PER_BLOCK_X;
 
-    thrust::device_vector<int32_t> outputCuda;
+    thrust::device_vector<i32> outputCuda;
     outputCuda.resize( blocksDispatchedCount ); // doesn't really matter bc we access the raw mem
 
     KernelReduceBlocksWithWARP<THREADS_PER_BLOCK_X><<<blocksDispatchedCount, THREADS_PER_BLOCK_X>>>( 
@@ -263,29 +315,31 @@ thrust::device_vector<int32_t> DispatchReductionKernel_CUDA( const thrust::devic
     return outputCuda;
 };
 
-template<prefix_scan_t SCAN_TYPE, uint64_t THREADS_PER_BLOCK_X>
-thrust::device_vector<int32_t> DispatchChainPrefixScanKernel_CUDA( const thrust::device_vector<int32_t>& blockReductions )
+template<prefix_scan_t SCAN_TYPE, u64 THREADS_PER_BLOCK_X>
+thrust::device_vector<i32> DispatchChainPrefixScanKernel_CUDA( const thrust::device_vector<i32>& blockReductions )
 {
-    const uint64_t size = std::size( blockReductions );
-    const uint64_t blocksDispatchedCount = ( size + THREADS_PER_BLOCK_X - 1 ) / THREADS_PER_BLOCK_X;
+    const u64 size = std::size( blockReductions );
+    const u64 blocksDispatchedCount = ( size + THREADS_PER_BLOCK_X - 1 ) / THREADS_PER_BLOCK_X;
 
-    thrust::device_vector<int32_t> outputCuda;
+    thrust::device_vector<i32> outputCuda;
     outputCuda.resize( size ); // doesn't really matter bc we access the raw mem
 
-    thrust::device_ptr<uint64_t> globalGroupCounter = thrust::device_new<uint64_t>();
+    thrust::device_ptr<u64> globalGroupCounter = thrust::device_new<u64>();
     *globalGroupCounter = 0;
 
-    thrust::device_vector<uint32_t> globalSemaphoreFlags;
-    globalSemaphoreFlags.resize( blocksDispatchedCount, 0 );
-    globalSemaphoreFlags[ 0 ] = uint32_t( -1 ); // NOTE: first block/group is ready to go
+    thrust::device_vector<u32> globalBlockState;
+    globalBlockState.resize( blocksDispatchedCount, atomic_prefix_block_state::UNAVAILABLE );
 
-    thrust::device_vector<int32_t> globalBlockPartialScans;
-    globalBlockPartialScans.resize( blocksDispatchedCount, 0 );
+    thrust::device_vector<i32> globalBlockLocalScans;
+    globalBlockLocalScans.resize( blocksDispatchedCount );
+    thrust::device_vector<i32> globalBlockPartialScans;
+    globalBlockPartialScans.resize( blocksDispatchedCount );
 
-    KernelChainPrefixScan<SCAN_TYPE, THREADS_PER_BLOCK_X><<<blocksDispatchedCount, THREADS_PER_BLOCK_X>>>( 
+    KernelChainPrefixScanWithDecoupledLookback<SCAN_TYPE, THREADS_PER_BLOCK_X><<<blocksDispatchedCount, THREADS_PER_BLOCK_X>>>( 
         thrust::raw_pointer_cast( std::data( blockReductions ) ), size,
         thrust::raw_pointer_cast( globalGroupCounter ),
-        thrust::raw_pointer_cast( std::data( globalSemaphoreFlags ) ),
+        thrust::raw_pointer_cast( std::data( globalBlockState ) ),
+        thrust::raw_pointer_cast( std::data( globalBlockLocalScans ) ),
         thrust::raw_pointer_cast( std::data( globalBlockPartialScans ) ),
         thrust::raw_pointer_cast( std::data( outputCuda ) )
     );
@@ -325,7 +379,7 @@ struct random_generator
     inline random_generator() : gen{ std::random_device{}() } {}
 
     template<typename T>
-    std::vector<T> GenerateNIntegers( uint64_t n, T rangeMin, T rangeMax )
+    std::vector<T> GenerateNIntegers( u64 n, T rangeMin, T rangeMax )
     {
         std::uniform_int_distribution<T> dist{ rangeMin, rangeMax };
 
@@ -338,13 +392,13 @@ struct random_generator
     }
 };
 
-template<uint64_t THREADS_PER_BLOCK_X, typename T>
+template<u64 THREADS_PER_BLOCK_X, typename T>
 inline std::vector<T> Reduction_CPU( const std::vector<T>& inputData )
 {
     std::vector<T> blockReductionsCPU;
-    for( uint64_t i = 0; i < std::size( inputData );  )
+    for( u64 i = 0; i < std::size( inputData );  )
     {
-        const uint64_t step = std::min( THREADS_PER_BLOCK_X, std::size( inputData ) - i );
+        const u64 step = std::min( THREADS_PER_BLOCK_X, std::size( inputData ) - i );
 
         const auto cbegin = std::cbegin( inputData ) + i;
         const auto cend = cbegin + step;
@@ -359,29 +413,30 @@ inline std::vector<T> Reduction_CPU( const std::vector<T>& inputData )
 }
 
 constexpr bool CHECK_CORRECTNESS = true;
-constexpr uint64_t THREADS_PER_BLOCK = 512;
+constexpr u64 THREADS_PER_BLOCK = 512;
 
 int main()
 {
-    constexpr uint64_t elemCount = 1'000'000;
+    constexpr u64 elemCount = 1'000'000;
 
     random_generator randGen;
-    std::vector<int32_t> inputData = randGen.GenerateNIntegers<int32_t>( 
+    std::vector<i32> inputData = randGen.GenerateNIntegers<i32>( 
         elemCount, std::numeric_limits<int8_t>::min(), std::numeric_limits<int8_t>::max() );
 
-    std::vector<int32_t> resultCpu( std::size( inputData ) );
+    std::vector<i32> resultCpu( std::size( inputData ) );
     std::exclusive_scan( std::execution::par, std::cbegin( inputData ), std::cend( inputData ), std::begin( resultCpu ), 0 );
 
     cuda_context cudaCtx;
     
     auto resultCudaThrust = DispatchChainPrefixScanKernel_CUDA<prefix_scan_t::EXCLUSIVE, THREADS_PER_BLOCK>( inputData );
 
-    std::vector<int32_t> resultCuda = { std::cbegin( resultCudaThrust ), std::cend( resultCudaThrust ) };
+    std::vector<i32> resultCuda = { std::cbegin( resultCudaThrust ), std::cend( resultCudaThrust ) };
 
     if constexpr( CHECK_CORRECTNESS )
     {
         auto CmpOp = [] ( const auto& a, const auto& b ) { return a == b; };
-        assert( ElementWiseRangeStrictCompare( resultCpu, resultCuda, CmpOp ) );
+        std::span<const i32> cudaSpan = { thrust::raw_pointer_cast( std::data( resultCuda ) ), std::size( resultCuda ) };
+        assert( ElementWiseRangeStrictCompare( resultCpu, cudaSpan, CmpOp ) );
     }
     
     std::cout << "DONE!\n";
