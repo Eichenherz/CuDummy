@@ -59,6 +59,9 @@ inline bool ElementWiseRangeStrictCompare( const Range1 & a, const Range2 & b, C
     //    std::execution::par, std::cbegin( a ), std::cend( a ), std::cbegin( b ), true, std::logical_and<>(), cmpOp );
 }
 
+template<typename T>
+concept Number32BitsMax = ( sizeof( T ) <= 4 );
+
 // NOTE: always POT
 constexpr u64 WARP_SIZE = 32u;
 static_assert( std::has_single_bit( WARP_SIZE ), "WARP_SIZE not POT" );
@@ -191,7 +194,7 @@ __device__ T ThreadBlockInclusiveScanWithSync( const T currentThreadValue )
     return threadScan;
 }
 
-enum atomic_prefix_block_state : u32
+enum prefix_block_flags : u8
 {
     UNAVAILABLE = 0,
     HAS_LOCAL_PREFIX = 1,
@@ -203,14 +206,32 @@ enum class prefix_scan_t : u8
     INCLUSIVE,
     EXCLUSIVE
 };
-template<prefix_scan_t SCAN_TYPE, u64 THREADS_PER_BLOCK_X, typename T>
+
+struct alignas( u64 ) prefix_block_state
+{
+    u32 scan = 0;
+    u32 flag = 0;
+
+    __host__ __device__ inline explicit operator u64() const
+    {
+        return std::bit_cast<u64>( *this );
+    }
+};
+
+__host__ __device__ inline prefix_block_state PrefixBlockStateFromU64( u64 addr )
+{
+    return std::bit_cast<prefix_block_state>( addr );
+}
+static_assert( alignof( prefix_block_state ) == alignof( u64 ), "prefix_block_state doesn't obey alignment requirement !" );
+static_assert( sizeof( prefix_block_state ) == sizeof( u64 ), "prefix_block_state doesn't obey size requirement !" );
+
+
+template<prefix_scan_t SCAN_TYPE, u64 THREADS_PER_BLOCK_X, Number32BitsMax T>
 __global__ void KernelChainPrefixScanWithDecoupledLookback( 
     const T*                 input,
     u64                      workElemCount,
     u64*                     globalGroupCounter,
-    u32*                     globalBlockState,
-    T*                       globalBlockLocalScans,
-    T*                       globalBlockPartialScans,
+    u64*                     globalBlockStates,
     T*                       scannedOut 
 ) {
     constexpr u64 WARPS_PER_BLOCK = THREADS_PER_BLOCK_X / WARP_SIZE;
@@ -221,6 +242,8 @@ __global__ void KernelChainPrefixScanWithDecoupledLookback(
     if( threadIdx.x == 0 )
     {
         sharedCurrerntBlockIdx = atomicAdd( globalGroupCounter, 1 );
+        // NOTE: zero init
+        atomicExch( &globalBlockStates[ sharedCurrerntBlockIdx ], 0u );
     }   
     __syncthreads();
 
@@ -243,42 +266,42 @@ __global__ void KernelChainPrefixScanWithDecoupledLookback(
     }
     __syncthreads();
 
+    
     __shared__ T sharedPrevScan;
     // NOTE: here we force order the blocks, but we'll keep looking backwards until we find a PREFIX STATE
     if( threadIdx.x == 0 )
     {
-        globalBlockLocalScans[ sharedCurrerntBlockIdx ] = sharedLocalBlockScan;
-        __threadfence();
-
-        atomicAdd( &globalBlockState[ sharedCurrerntBlockIdx ], 1 );
+        prefix_block_state currentBlockState = {
+            .scan = std::bit_cast< u32 >( sharedLocalBlockScan ), .flag = prefix_block_flags::HAS_LOCAL_PREFIX };
+        atomicExch( &globalBlockStates[ sharedCurrerntBlockIdx ], u64( currentBlockState ) );
 
         const bool isNotFirstBlock = 0 != sharedCurrerntBlockIdx;
 
-        T currentPrefixScan = T{};
+        T lookbackScan = T{};
         for( i64 lookbackBlockIdx = sharedCurrerntBlockIdx - 1; isNotFirstBlock && lookbackBlockIdx >= 0; )
         {
-            const u32 currentLookbackBlockState = atomicAdd( &globalBlockState[ lookbackBlockIdx ], 0 );
+            const prefix_block_state currentLookbackBlockState =
+                PrefixBlockStateFromU64( atomicAdd( &globalBlockStates[ lookbackBlockIdx ], 0 ) );
 
-            //if( atomic_prefix_block_state::UNAVAILABLE == currentLookbackBlockState ) continue;
-            //else 
-            if( atomic_prefix_block_state::HAS_LOCAL_PREFIX == currentLookbackBlockState )
+            const T currentLookbackBlockScan = ( const T& ) currentLookbackBlockState.scan;
+            if( prefix_block_flags::HAS_LOCAL_PREFIX == currentLookbackBlockState.flag )
             {
-                currentPrefixScan += globalBlockLocalScans[ lookbackBlockIdx ];
+                lookbackScan += currentLookbackBlockScan;
                 --lookbackBlockIdx;
             }
-            else if( atomic_prefix_block_state::HAS_FULL_PREFIX == currentLookbackBlockState )
+            else if( prefix_block_flags::HAS_FULL_PREFIX == currentLookbackBlockState.flag )
             {
-                currentPrefixScan += globalBlockPartialScans[ lookbackBlockIdx ];
+                lookbackScan += currentLookbackBlockScan;
                 break;
             }
         }
 
-        sharedPrevScan = currentPrefixScan;
-        globalBlockPartialScans[ sharedCurrerntBlockIdx ] = currentPrefixScan + sharedLocalBlockScan;
-        __threadfence();
+        sharedPrevScan = lookbackScan;
 
-        atomicAdd( &globalBlockState[ sharedCurrerntBlockIdx ], 1 );
-    };
+        const T blockPrefixScan = lookbackScan + sharedLocalBlockScan;
+        currentBlockState = { .scan = std::bit_cast< u32 >( blockPrefixScan ), .flag = prefix_block_flags::HAS_FULL_PREFIX };
+        atomicExch( &globalBlockStates[ sharedCurrerntBlockIdx ], u64( currentBlockState ) );
+    }
     __syncthreads();
 
     if( globalIdx < workElemCount )
@@ -327,20 +350,14 @@ thrust::device_vector<i32> DispatchChainPrefixScanKernel_CUDA( const thrust::dev
     thrust::device_ptr<u64> globalGroupCounter = thrust::device_new<u64>();
     *globalGroupCounter = 0;
 
-    thrust::device_vector<u32> globalBlockState;
-    globalBlockState.resize( blocksDispatchedCount, atomic_prefix_block_state::UNAVAILABLE );
+    thrust::device_vector<u64> globalBlockStates;
+    globalBlockStates.resize( blocksDispatchedCount );
 
-    thrust::device_vector<i32> globalBlockLocalScans;
-    globalBlockLocalScans.resize( blocksDispatchedCount );
-    thrust::device_vector<i32> globalBlockPartialScans;
-    globalBlockPartialScans.resize( blocksDispatchedCount );
-
-    KernelChainPrefixScanWithDecoupledLookback<SCAN_TYPE, THREADS_PER_BLOCK_X><<<blocksDispatchedCount, THREADS_PER_BLOCK_X>>>( 
+    KernelChainPrefixScanWithDecoupledLookback<SCAN_TYPE, THREADS_PER_BLOCK_X>
+        <<<blocksDispatchedCount, THREADS_PER_BLOCK_X>>>( 
         thrust::raw_pointer_cast( std::data( blockReductions ) ), size,
         thrust::raw_pointer_cast( globalGroupCounter ),
-        thrust::raw_pointer_cast( std::data( globalBlockState ) ),
-        thrust::raw_pointer_cast( std::data( globalBlockLocalScans ) ),
-        thrust::raw_pointer_cast( std::data( globalBlockPartialScans ) ),
+        thrust::raw_pointer_cast( std::data( globalBlockStates ) ),
         thrust::raw_pointer_cast( std::data( outputCuda ) )
     );
 
