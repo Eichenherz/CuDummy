@@ -71,13 +71,13 @@ __device__ inline u64 LaneId() { return threadIdx.x & ( WARP_SIZE - 1 ); }
 __device__ inline u64 WarpId() { return threadIdx.x >> WAPR_SZ_SHIFT; }
 
 template<typename T>
-__device__ T WarpReduceShflDownSync( const T in, u32 activeLanesMask )
+__device__ T WarpReduceShflDownSync( const T in )
 {
     T sum = in;
 #pragma unroll
     for( u64 offsetWithinWarp = WARP_SIZE >> 1; offsetWithinWarp > 0; offsetWithinWarp >>= 1 ) 
     {
-        sum += __shfl_down_sync( activeLanesMask, sum, offsetWithinWarp );
+        sum += __shfl_down_sync( u32( -1 ), sum, offsetWithinWarp );
     }
 
     return sum;
@@ -151,7 +151,7 @@ __global__ void KernelReduceBlocksWithWARP( const T* input, u64 workElemCount, T
             const T currentPartialWarpSum = sharedPartialWarpReductions[ threadIdx.x ];
             // TODO: if this incurrs a perf issue ( due to wasted lanes ) we can use a mask to select only the active threads
             constexpr u32 ACTIVE_LANES_MASK = ( 1u << WARPS_PER_BLOCK ) - 1;
-            thisBlockSum = WarpReduceShflDownSync( currentPartialWarpSum, 0xffffffff );
+            thisBlockSum = WarpReduceShflDownSync( currentPartialWarpSum );
         }
     }
   
@@ -228,17 +228,17 @@ static_assert( sizeof( prefix_block_state ) == sizeof( u64 ), "prefix_block_stat
 
 template<prefix_scan_t SCAN_TYPE, u64 THREADS_PER_BLOCK_X, Number32BitsMax T>
 __global__ void KernelChainPrefixScanWithDecoupledLookback(
-    const T* input,
+    const T*                 input,
     u64                      workElemCount,
-    u64* globalGroupCounter,
-    u64* globalBlockStates,
-    T* scannedOut
+    u64*                     globalGroupCounter,
+    u64*                     globalBlockStates,
+    T*                       scannedOut
 ) {
     constexpr u64 WARPS_PER_BLOCK = THREADS_PER_BLOCK_X / WARP_SIZE;
     static_assert( WARPS_PER_BLOCK <= MAX_WARPS_PER_BLOCK, "ERR: Block has more warps !" );
 
     // NOTE: need to get the dynamic idx of the block
-    __shared__ u64 sharedCurrerntBlockIdx;
+    __shared__ u32 sharedCurrerntBlockIdx;
     if( threadIdx.x == 0 )
     {
         sharedCurrerntBlockIdx = atomicAdd( globalGroupCounter, 1 );
@@ -266,15 +266,7 @@ __global__ void KernelChainPrefixScanWithDecoupledLookback(
     }
     __syncthreads();
 
-    __shared__ u64 lookbackOffset;
-    __shared__ T lookbackScan;
-    if( threadIdx.x == 0 )
-    {
-        lookbackOffset = sharedCurrerntBlockIdx - 1;
-        lookbackScan = T{};
-    }
-
-    // NOTE: got local scan ready
+    // NOTE: local scan ready
     if( threadIdx.x == 0 )
     {
         prefix_block_state currentBlockState = {
@@ -282,76 +274,91 @@ __global__ void KernelChainPrefixScanWithDecoupledLookback(
         atomicExch( &globalBlockStates[ sharedCurrerntBlockIdx ], u64( currentBlockState ) );
     }
 
-    // NOTE: we'll keep looking backwards until we find a PREFIX STATE or all threads are outside the loockback bounds
-    // NOTE: __syncthreads is safe in this loop bc there's no condition on it
-    for( ;; )
+    __shared__ T sharedLookbackScan;
+    if( threadIdx.x == 0 )
     {
-        __syncthreads();
+        sharedLookbackScan = T{};
+    }
 
-        const i64 currentLookbackIdx = lookbackOffset - threadIdx.x;
-        const bool isThreadInRange = currentLookbackIdx >= 0;
+    __syncthreads();
 
-        const u32 inRangeMask = __ballot_sync( u32( -1 ), isThreadInRange );
-        if( 0 == inRangeMask )
-        {
-            break;
-        }
-
-        prefix_block_state currentLookbackBlockState = {};
-        if( isThreadInRange )
-        {
-            currentLookbackBlockState = PrefixBlockStateFromU64( atomicAdd( &globalBlockStates[ currentLookbackIdx ], 0 ) );
-        }
-
-        const u32 flag = currentLookbackBlockState.flag;
-
-        const u32 hasLocalScanMask = __ballot_sync( inRangeMask, prefix_block_flags::HAS_LOCAL_PREFIX == flag );
-        const u32 hasFullScanMask = __ballot_sync( inRangeMask, prefix_block_flags::HAS_FULL_PREFIX == flag );
-
-        const bool warpHasLocalScan = inRangeMask == hasLocalScanMask;
-        const bool warpIsValidAndHasAtLeastOneFullScan = inRangeMask == ( hasFullScanMask | hasLocalScanMask );
-
-        const u32 lsb = std::countr_zero( hasFullScanMask );
-        // NOTE: mask with all bits <= lsb set
-        const u32 fullScanMask = ( 1u << ( lsb + 1 ) ) - 1;
-
-        const u32 warpScanMask = ( warpHasLocalScan ) ? hasLocalScanMask :
-            ( warpIsValidAndHasAtLeastOneFullScan ) ? fullScanMask : 0;
-
-        if( 0 == warpScanMask ) continue;
-
-        const T currentLookbackScan = ( const T& ) currentLookbackBlockState.scan;
-        const T currentWarpLookbackScan = WarpReduceShflDownSync( currentLookbackScan, warpScanMask );
-
+    // NOTE: we'll keep looking backwards until we find a PREFIX STATE or all threads are outside the lookback bounds
+    if( ( WarpId() == 0 ) && ( threadIdx.x < WARP_SIZE ) )
+    {
+        i64 lookbackOffset;
         if( LaneId() == 0 )
         {
-            atomicAdd( &lookbackScan, currentWarpLookbackScan );
+            lookbackOffset = i64( sharedCurrerntBlockIdx ) - WARP_SIZE;
         }
 
-        if( !warpHasLocalScan && warpIsValidAndHasAtLeastOneFullScan )
+        for( ;; )
         {
-            break;
-        }
-        
-        __syncthreads();
-        if( threadIdx.x == 0 )
-        {
-            lookbackOffset -= blockDim.x;
+            const i64 warpLookbackOffset = __shfl_sync( u32( -1 ), lookbackOffset, 0 );
+            const i64 currentLookbackIdx = warpLookbackOffset + threadIdx.x;
+            const bool isThreadInRange = currentLookbackIdx >= 0;
+
+            const u32 activeLanesMask = __ballot_sync( u32( -1 ), isThreadInRange );
+            if( 0 == activeLanesMask )
+            {
+                break;
+            }
+
+            prefix_block_state currentLookbackBlockState = {};
+            if( isThreadInRange )
+            {
+                currentLookbackBlockState = PrefixBlockStateFromU64( atomicAdd( &globalBlockStates[ currentLookbackIdx ], 0 ) );
+            }
+
+            const u32 flag = currentLookbackBlockState.flag;
+
+            const u32 unavailableMask = __ballot_sync( activeLanesMask, prefix_block_flags::UNAVAILABLE == flag );
+            if( unavailableMask ) continue;
+
+            const u32 hasLocalScanMask = __ballot_sync( activeLanesMask, prefix_block_flags::HAS_LOCAL_PREFIX == flag );
+            const u32 hasFullScanMask = __ballot_sync( activeLanesMask, prefix_block_flags::HAS_FULL_PREFIX == flag );
+            // NOTE: at this stage we can't have any invalid scans, they either all LOCAL or there's at least one FULL
+
+            // NOTE: the bools and mask computation are warp-uniform
+            const bool warpHasOnlyValidStates = ( hasLocalScanMask | hasFullScanMask ) == activeLanesMask;
+            const bool warpHasAtLeastOneFullScan = warpHasOnlyValidStates && ( hasFullScanMask != 0 );
+            
+            u32 warpScanMask = hasLocalScanMask;
+            if( warpHasAtLeastOneFullScan )
+            {
+                const u32 fullScanHighestIdx = ( WARP_SIZE - 1 ) - std::countl_zero( hasFullScanMask );
+                const u32 fullScanMask = ~( ( 1u << fullScanHighestIdx ) - 1 ) & activeLanesMask;
+                warpScanMask = fullScanMask;
+            }
+            
+            T currentLookbackScan = ( const T& ) currentLookbackBlockState.scan;
+            // NOTE: Pascal doesn't have __reduce instructions and 
+            // the easiest way to compute the scan is use a full warp and zero the masked elements
+            currentLookbackScan = ( ( warpScanMask >> LaneId() ) & 1 ) ? currentLookbackScan : T{};
+            const T currentWarpLookbackScan = WarpReduceShflDownSync( currentLookbackScan );
+
+            if( LaneId() == 0 )
+            {
+                sharedLookbackScan += currentWarpLookbackScan;
+                lookbackOffset -= WARP_SIZE;
+            }
+
+            if( warpHasAtLeastOneFullScan ) break;
         }
     }
-    
+
     __syncthreads();
 
     if( threadIdx.x == 0 )
     {
-        const T blockPrefixScan = lookbackScan + sharedLocalBlockScan;
-        currentBlockState = { .scan = std::bit_cast<u32>( blockPrefixScan ), .flag = prefix_block_flags::HAS_FULL_PREFIX };
+        const T blockPrefixScan = sharedLookbackScan + sharedLocalBlockScan;
+        prefix_block_state currentBlockState = { 
+            .scan = std::bit_cast<u32>( blockPrefixScan ), .flag = prefix_block_flags::HAS_FULL_PREFIX };
         atomicExch( &globalBlockStates[ sharedCurrerntBlockIdx ], u64( currentBlockState ) );
     }
 
     if( globalIdx < workElemCount )
     {
-        T currentOut = blockScanThreadElem + lookbackScan;
+        T currentOut = blockScanThreadElem + sharedLookbackScan;
         if constexpr( SCAN_TYPE == prefix_scan_t::EXCLUSIVE )
         {
             currentOut -= currentElemToSum;
