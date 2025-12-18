@@ -90,6 +90,10 @@
   <ItemGroup>
     <None Include=".gitignore" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="core_types.h" />
+    <ClInclude Include="warps.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 12.9.targets" />
