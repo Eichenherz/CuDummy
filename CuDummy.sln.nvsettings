@@ -1,2 +1,2 @@
 [WarpWatch]
-Expressions=currentLookbackIdx, unavailableMask, hasLocalScanMask, hasFullScanMask, warpHasLocalScan, warpIsValidAndHasAtLeastOneFullScan, currentWarpLookbackScan, sharedLookbackScan, currentLookbackScan, flag
+Expressions=digit, binIdx

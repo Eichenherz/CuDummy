@@ -6,16 +6,15 @@
 #include <device_launch_parameters.h>
 #include <bit>
 
-// NOTE: always POT
+
 constexpr u64 WARP_SIZE = 32u;
-static_assert( std::has_single_bit( WARP_SIZE ), "WARP_SIZE not POT" );
 constexpr u64 WARP_SZ_SHIFT = std::bit_width( WARP_SIZE ) - 1u;
+static_assert( std::has_single_bit( WARP_SIZE ), "WARP_SIZE not POT" );
 
 __device__ inline u64 LaneId() { return threadIdx.x & ( WARP_SIZE - 1 ); }
 __device__ inline u64 WarpId() { return threadIdx.x >> WARP_SZ_SHIFT; }
 
 // NOTE: pre-Turing gpus don't support __reduce warp ops
-
 template<typename T>
 __device__ T WarpReduceShflDownSync( const T in )
 {

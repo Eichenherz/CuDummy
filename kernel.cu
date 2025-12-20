@@ -153,7 +153,7 @@ __device__ T ThreadBlockInclusiveScanSyncWithMem( const T currentThreadValue )
 // TODO: do we need any guarantees of shared mem sz ?
 // NOTE: assumes lds is initialized correctly if needed
 template<typename T>
-__device__ T ThreadblockInclusiveScanSync( const T currentThreadValue, std::span<T> ldsWarpExclusiveScans )
+__device__ T ThreadBlockInclusiveScanSync( const T currentThreadValue, std::span<T> ldsWarpExclusiveScans )
 {
     const T warpInclusiveScanCurrentLane = WarpInclusiveScanShflUpSync( currentThreadValue );
     // NOTE: the suffle up will have place the complete warp scan in the last lane !
@@ -352,7 +352,7 @@ __global__ void KernelChainPrefixScanWithDecoupledLookback(
 
 // NOTE: taken from https://github.com/GPUOpen-LibrariesAndSDKs/Orochi/blob/main/ParallelPrimitives/RadixSortKernels.h
 constexpr u64 RADIX_DIGIT_BIT_COUNT = 8;
-constexpr u64 RADIX_BIN_SIZE = 1 << RADIX_DIGIT_BIT_COUNT;
+constexpr u64 RADIX_BIN_COUNT = 1 << RADIX_DIGIT_BIT_COUNT;
 constexpr u64 RADIX_DIGIT_MASK = ( 1u << RADIX_DIGIT_BIT_COUNT ) - 1;
 
 constexpr u64 RADIX_SORT_BLOCK_SIZE = 4096;
@@ -419,11 +419,11 @@ __global__ void KernelOrochiRadixHistogram(
 ) {
     constexpr u64 ITEMS_PER_BLOCK = ITEMS_PER_THREAD * THREADS_PER_BLOCK_X;
 
-    __shared__ u32 sharedPerDigitHistograms[ sizeof( radix_sort_key_t ) ][ RADIX_BIN_SIZE ];
+    __shared__ u32 sharedPerDigitHistograms[ sizeof( radix_sort_key_t ) ][ RADIX_BIN_COUNT ];
 
     for( u64 i = 0; i < sizeof( radix_sort_key_t ); ++i )
     {
-        for( u64 j = threadIdx.x; j < RADIX_BIN_SIZE; j += THREADS_PER_BLOCK_X )
+        for( u64 j = threadIdx.x; j < RADIX_BIN_COUNT; j += THREADS_PER_BLOCK_X )
         {
             sharedPerDigitHistograms[ i ][ j ] = 0;
         }
@@ -463,36 +463,37 @@ __global__ void KernelOrochiRadixHistogram(
 
     for( u64 i = 0; i < sizeof( radix_sort_key_t ); ++i )
     {
-        scanExclusive<u32>( 0, &sharedPerDigitHistograms[ i ][ 0 ], RADIX_BIN_SIZE );
+        scanExclusive<u32>( 0, &sharedPerDigitHistograms[ i ][ 0 ], RADIX_BIN_COUNT );
     }
 
     for( u64 i = 0; i < sizeof( radix_sort_key_t ); ++i )
     {
-        for( u64 j = threadIdx.x; j < RADIX_BIN_SIZE; j += THREADS_PER_BLOCK_X )
+        for( u64 j = threadIdx.x; j < RADIX_BIN_COUNT; j += THREADS_PER_BLOCK_X )
         {
-            atomicAdd( &gScansBuffer[ RADIX_BIN_SIZE * i + j ], sharedPerDigitHistograms[ i ][ j ] );
+            atomicAdd( &gScansBuffer[ RADIX_BIN_COUNT * i + j ], sharedPerDigitHistograms[ i ][ j ] );
         }
     }
 }
 
 // TODO: we can shrink our data storage as much as ( WORST CASE ): #items per block will fit in one bin
-template<u64 RADIX_DIGIT_BIT_SIZE>
+template<u64 RADIX_DIGIT_BIT_WIDTH>
 struct radix_histogram_config_t
 {
     using radix_key_t = u32;
 
-    static constexpr u64 DIGIT_BINS = 1u << RADIX_DIGIT_BIT_SIZE;
-    static constexpr u64 DIGITS = sizeof( radix_key_t ) / RADIX_DIGIT_BIT_SIZE;
-    static constexpr u64 DIGIT_MASK = ( 1u << RADIX_DIGIT_BIT_SIZE ) - 1;
+    static constexpr u32 DIGIT_BIT_WIDTH = RADIX_DIGIT_BIT_WIDTH;
+    static constexpr u32 DIGIT_BINS = 1u << RADIX_DIGIT_BIT_WIDTH;
+    static constexpr u32 DIGITS = sizeof( radix_key_t ) * 8 / RADIX_DIGIT_BIT_WIDTH;
+    static constexpr u32 DIGIT_MASK = ( 1u << RADIX_DIGIT_BIT_WIDTH ) - 1;
 
-    static constexpr u64 DATA_SIZE = DIGIT_BINS * RADIX_DIGIT_BIT_SIZE;
+    static constexpr u32 DATA_SIZE = DIGIT_BINS * DIGITS;
 
-    __device__ static u32 ExtractDigit( u32 x, u32 bitLocation ) { return ( x >> bitLocation ) & DIGIT_MASK; }
+    __device__ static u32 ExtractDigit( u32 x, u32 digitIdx ) { return ( x >> digitIdx * DIGIT_BIT_WIDTH ) & DIGIT_MASK; }
 };
 
 // NOTE: we expect this to have many digits and few bins
 template<u64 THREADS_PER_BLOCK_X, u64 ITEMS_PER_THREAD, u32 ORDER_MASK>
-__global__ void KernelRadixHistogram( const radix_sort_key_t* input, u64 workElemCount, u32* gScansBuffer, u32* gBlockCounter )
+__global__ void KernelRadixHistogram( const radix_sort_key_t* input, u64 workElemCount, u32* gHistogram, u32* gBlockCounter )
 {
     // NOTE: need this bc we'll not have a 1:1 thread:workItem mapping
     constexpr u64 ITEMS_PER_BLOCK = ITEMS_PER_THREAD * THREADS_PER_BLOCK_X;
@@ -502,7 +503,6 @@ __global__ void KernelRadixHistogram( const radix_sort_key_t* input, u64 workEle
 
     // NOTE: transpose so we can coalesce for reduction
     __shared__ u16 ldsWarpPerDigitHistograms[ radix_histo_config::DATA_SIZE ][ KERNEL_WARPS_PER_BLOCK ];
-#pragma unroll 16
     for( u64 i = LaneId(); i < radix_histo_config::DATA_SIZE; i += WARP_SIZE )
     {
         ldsWarpPerDigitHistograms[ i ][ WarpId() ] = 0;
@@ -510,26 +510,26 @@ __global__ void KernelRadixHistogram( const radix_sort_key_t* input, u64 workEle
 
     const u32 numBlocks = ( workElemCount + ITEMS_PER_BLOCK - 1 ) / ITEMS_PER_BLOCK;
 
-    __shared__ u64 blockIdx;
+    __shared__ u64 currentBlockIdx;
     for( ;; )
     {
         if( threadIdx.x == 0 )
         {
-            blockIdx = atomicAdd( gBlockCounter, 1 );
+            currentBlockIdx = atomicAdd( gBlockCounter, 1 );
         }
         __syncthreads();
 
-        if( numBlocks <= blockIdx ) break;
+        if( numBlocks <= currentBlockIdx ) break;
 
-        const u64 globalOffset = blockIdx * ITEMS_PER_BLOCK + threadIdx.x * ITEMS_PER_THREAD;
+        const u64 globalOffset = currentBlockIdx * ITEMS_PER_BLOCK + threadIdx.x * ITEMS_PER_THREAD;
         for( u64 itemIdx = 0; itemIdx < ITEMS_PER_THREAD; ++itemIdx )
         {
             const u64 globalIdx = globalOffset + itemIdx;
-            const bool activeLanesMask = globalIdx < workElemCount;
+            const bool laneActive = globalIdx < workElemCount;
+            const u32 activeLanesMask = __ballot_sync( u32( -1 ), laneActive );
 
-            const radix_sort_key_t item = ( activeLanesMask ) ? input[ globalIdx ] : 0;
+            const radix_sort_key_t item = ( laneActive ) ? input[ globalIdx ] : 0;
 
-        #pragma unroll
             for( u32 digitIdx = 0; digitIdx < radix_histo_config::DIGITS; ++digitIdx )
             {
                 const u32 digit = radix_histo_config::ExtractDigit( GetKeyBits<ORDER_MASK>( item ), digitIdx );
@@ -543,7 +543,8 @@ __global__ void KernelRadixHistogram( const radix_sort_key_t* input, u64 workEle
                     if( ( LaneId() == 0 ) && warpCountForBin )
                     {
                         u32 binHistoIdx = digitIdx * radix_histo_config::DIGIT_BINS + binIdx;
-                        ldsWarpPerDigitHistograms[ binHistoIdx ][ WarpId() ] += warpCountForBin;
+                        u64 warpId = WarpId();
+                        ldsWarpPerDigitHistograms[ binHistoIdx ][ warpId ] += warpCountForBin;
                     }
                 }
             }
@@ -551,34 +552,34 @@ __global__ void KernelRadixHistogram( const radix_sort_key_t* input, u64 workEle
         __syncthreads();
     }
 
-    // NOTE: exclusive scan the warp-local histos to warp 0 slot
-#pragma unroll
+    __syncthreads();
+    // NOTE: exclusive scan the warp-local histos to warp 0th slot
     for( u32 digitIdx = WarpId(); digitIdx < radix_histo_config::DIGITS; digitIdx += KERNEL_WARPS_PER_BLOCK )
     {
         u16 prevScan = 0;
+        
     #pragma unroll
         for( u64 binIdx = 0; binIdx < radix_histo_config::DIGIT_BINS; ++binIdx )
         {
             u32 binHistoIdx = digitIdx * radix_histo_config::DIGIT_BINS + binIdx;
-
-            // NOTE: only WARPS_COUNT thread and 0 the rest bc we need a full WARP for the reduction
+    
+            // NOTE: need a full WARP for the reduction so we 0 the "invalid" threads
             u16 binItem = ( LaneId() < KERNEL_WARPS_PER_BLOCK ) ? ldsWarpPerDigitHistograms[ binHistoIdx ][ LaneId() ] : 0;
-
+    
             u16 blockBinItem = WarpReduceShflDownSync( binItem );
             if( LaneId() == 0 )
             {
                 ldsWarpPerDigitHistograms[ binHistoIdx ][ 0 ] = prevScan;
                 prevScan += blockBinItem;
             }
-            __syncwarp();
         }
     }
     __syncthreads();
 
-#pragma unroll 16
+#pragma unroll 4
     for( u64 i = threadIdx.x; i < radix_histo_config::DATA_SIZE; i += THREADS_PER_BLOCK_X )
     {
-        atomicAdd( &gScansBuffer[ i ], ldsWarpPerDigitHistograms[ i ][ 0 ] );
+        atomicAdd( &gHistogram[ i ], ldsWarpPerDigitHistograms[ i ][ 0 ] );
     }
 }
 
@@ -628,16 +629,71 @@ thrust::device_vector<i32> DispatchChainPrefixScanKernel_CUDA( const thrust::dev
         thrust::raw_pointer_cast( std::data( outputCuda ) )
     );
 
-    // Check for any errors launching the kernel
     CUDA_CHECK( cudaGetLastError() );
-
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns any errors encountered during the launch.
     CUDA_CHECK( cudaDeviceSynchronize() );
 
     thrust::device_delete( globalGroupCounter );
 
     return outputCuda;
 };
+
+template<u64 THREADS_PER_BLOCK_X = RADIX_HISTOGRAM_THREADS_PER_BLOCK>
+auto DispatchOrochiHistogramKernel( const thrust::device_vector<radix_sort_key_t>& keys )
+{
+    constexpr u64 ITEMS_PER_BLOCK = THREADS_PER_BLOCK_X * RADIX_HISTOGRAM_ITEMS_PER_THREAD;
+
+    const u64 size = std::size( keys );
+    const u64 blocksDispatchedCount = ( size + ITEMS_PER_BLOCK - 1 ) / ITEMS_PER_BLOCK;
+
+    thrust::device_vector<u32> prefixBinsOut;
+    prefixBinsOut.resize( RADIX_BIN_COUNT * sizeof( radix_sort_key_t ), 0 );
+
+    auto globalGroupCounter = thrust::device_new<u32>();
+    *globalGroupCounter = 0;
+
+    KernelOrochiRadixHistogram<THREADS_PER_BLOCK_X, RADIX_HISTOGRAM_ITEMS_PER_THREAD, ASCENDING_MASK_32>
+        <<<blocksDispatchedCount, THREADS_PER_BLOCK_X>>>( 
+            thrust::raw_pointer_cast( std::data( keys ) ), size,
+            thrust::raw_pointer_cast( std::data( prefixBinsOut ) ),
+            thrust::raw_pointer_cast( globalGroupCounter )
+    );
+
+    CUDA_CHECK( cudaGetLastError() );
+    CUDA_CHECK( cudaDeviceSynchronize() );
+
+    thrust::device_delete( globalGroupCounter );
+
+    return prefixBinsOut;
+}
+
+template<u64 THREADS_PER_BLOCK_X, u64 ITEMS_PER_THREAD, u32 ORDER_MASK>
+auto DispatchRadixHistogramKernel( const thrust::device_vector<radix_sort_key_t>& keys )
+{
+    constexpr u64 ITEMS_PER_BLOCK = THREADS_PER_BLOCK_X * ITEMS_PER_THREAD;
+
+    const u64 size = std::size( keys );
+    const u64 blocksDispatchedCount = ( size + ITEMS_PER_BLOCK - 1 ) / ITEMS_PER_BLOCK;
+
+    thrust::device_vector<u32> prefixBinsOut;
+    prefixBinsOut.resize( radix_histogram_config_t<2>::DATA_SIZE, 0 );
+
+    auto globalGroupCounter = thrust::device_new<u32>();
+    *globalGroupCounter = 0;
+
+    KernelRadixHistogram<THREADS_PER_BLOCK_X, ITEMS_PER_THREAD, ORDER_MASK>
+        <<<blocksDispatchedCount, THREADS_PER_BLOCK_X>>>( 
+            thrust::raw_pointer_cast( std::data( keys ) ), size,
+            thrust::raw_pointer_cast( std::data( prefixBinsOut ) ),
+            thrust::raw_pointer_cast( globalGroupCounter )
+    );
+
+    CUDA_CHECK( cudaGetLastError() );
+    CUDA_CHECK( cudaDeviceSynchronize() );
+
+    thrust::device_delete( globalGroupCounter );
+
+    return prefixBinsOut;
+}
 
 
 struct cuda_context
@@ -660,10 +716,10 @@ struct random_generator
 {
     std::mt19937 gen;  
 
-    inline random_generator() : gen{ std::random_device{}() } {}
+    inline random_generator( u32 seed ) : gen{ seed } {}
 
     template<typename T>
-    std::vector<T> GenerateNIntegers( u64 n, T rangeMin, T rangeMax )
+    auto GenerateNIntegers( u64 n, T rangeMin, T rangeMax )
     {
         std::uniform_int_distribution<T> dist{ rangeMin, rangeMax };
 
@@ -677,7 +733,7 @@ struct random_generator
 };
 
 template<u64 THREADS_PER_BLOCK_X, typename T>
-inline std::vector<T> Reduction_CPU( const std::vector<T>& inputData )
+inline auto Reduction_CPU( const std::vector<T>& inputData )
 {
     std::vector<T> blockReductionsCPU;
     for( u64 i = 0; i < std::size( inputData );  )
@@ -696,31 +752,61 @@ inline std::vector<T> Reduction_CPU( const std::vector<T>& inputData )
     return blockReductionsCPU;
 }
 
+template<u64 RADIX>
+auto RadixHisto_CPU( const std::vector<radix_sort_key_t>& input )
+{
+    constexpr u64 RADIX_BIN_COUNT = 1 << RADIX;
+    constexpr u64 DIGIT_COUNT = sizeof( radix_sort_key_t ) * 8 / RADIX;
+    constexpr u64 DIGIT_MASK = ( 1u << RADIX ) - 1;
+
+    std::vector<u32> prefixHisto;
+    prefixHisto.resize( RADIX_BIN_COUNT * DIGIT_COUNT, 0 );
+
+    for( auto elem : input )
+    {
+        for( u64 digit = 0; digit < DIGIT_COUNT; ++digit )
+        {
+            const u64 shift = digit * RADIX;
+            u64 bin = ( elem >> shift ) & DIGIT_MASK;
+            prefixHisto[ digit * RADIX_BIN_COUNT + bin ]++;
+        }
+    }
+
+    for( u64 digit = 0; digit < DIGIT_COUNT; ++digit )
+    {
+        const u64 shift = digit * RADIX_BIN_COUNT;
+        auto begIt = std::begin( prefixHisto ) + shift;
+        auto endIt = begIt + RADIX_BIN_COUNT;
+        std::exclusive_scan( std::execution::par, begIt, endIt, begIt, 0 );
+    }
+    
+    return prefixHisto;
+}
+
 constexpr bool CHECK_CORRECTNESS = true;
 constexpr u64 THREADS_PER_BLOCK = 512;
 
 int main()
 {
-    constexpr u64 elemCount = 1'000'000;
+    constexpr u64 elemCount = 10'000;// 1'000'000;
 
-    random_generator randGen;
-    std::vector<i32> inputData = randGen.GenerateNIntegers<i32>( 
-        elemCount, std::numeric_limits<int8_t>::min(), std::numeric_limits<int8_t>::max() );
+    random_generator randGen = { std::random_device{}( ) };
+    auto inputData = randGen.GenerateNIntegers<radix_sort_key_t>( 
+        elemCount, std::numeric_limits<u16>::max(), std::numeric_limits<u32>::max() );
 
-    std::vector<i32> resultCpu( std::size( inputData ) );
-    std::exclusive_scan( std::execution::par, std::cbegin( inputData ), std::cend( inputData ), std::begin( resultCpu ), 0 );
+    auto radixHistoGroundTruth = RadixHisto_CPU<2>( inputData );
 
     cuda_context cudaCtx;
     
-    auto resultCudaThrust = DispatchChainPrefixScanKernel_CUDA<prefix_scan_t::EXCLUSIVE, THREADS_PER_BLOCK>( inputData );
+    auto radixHistoCuda = DispatchRadixHistogramKernel<
+        THREADS_PER_BLOCK, RADIX_HISTOGRAM_ITEMS_PER_THREAD, ASCENDING_MASK_32>( inputData );
 
-    std::vector<i32> resultCuda = { std::cbegin( resultCudaThrust ), std::cend( resultCudaThrust ) };
+    std::vector<u32> radixHistoCpu = { std::cbegin( radixHistoCuda ), std::cend( radixHistoCuda ) };
 
     if constexpr( CHECK_CORRECTNESS )
     {
         auto CmpOp = [] ( const auto& a, const auto& b ) { return a == b; };
-        std::span<const i32> cudaSpan = { thrust::raw_pointer_cast( std::data( resultCuda ) ), std::size( resultCuda ) };
-        assert( ElementWiseRangeStrictCompare( resultCpu, cudaSpan, CmpOp ) );
+        assert( ElementWiseRangeStrictCompare( radixHistoGroundTruth, radixHistoCpu, CmpOp ) );
     }
     
     std::cout << "DONE!\n";
